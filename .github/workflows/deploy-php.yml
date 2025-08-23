@@ -7,7 +7,8 @@ on:
 
 jobs:
   deploy:
-    runs-on: [ self-hosted ]  # add labels if you use them
+    runs-on: [ self-hosted ]   # add labels if you use them, e.g. [self-hosted, linux]
+
     env:
       APP_SRC: php-app
       DEPLOY_PATH: /var/www/html/php-app
@@ -17,7 +18,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Ensure the runner has ssh/scp/rsync (RHEL/Ubuntu runners covered)
       - name: Ensure ssh/scp/rsync present on runner
         run: |
           set -e
@@ -40,18 +40,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
-          # Use printf to avoid an extra newline; strip CRLF if pasted from Windows
           printf "%s" "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           sed -i 's/\r$//' ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-
-          # Preload host key so StrictHostKeyChecking won't block
           ssh-keyscan -p "${{ secrets.SSH_PORT }}" -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
 
-      - name: Quick connectivity test (verbose)
+      - name: Quick connectivity test
         run: |
           set -euo pipefail
-          ssh -vvv -o StrictHostKeyChecking=yes -i ~/.ssh/id_rsa -p "${{ secrets.SSH_PORT }}" \
+          ssh -o StrictHostKeyChecking=yes -i ~/.ssh/id_rsa -p "${{ secrets.SSH_PORT }}" \
             "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" 'echo "[remote] ssh ok: $(whoami) on $(hostname)"'
 
       - name: Upload app to remote /tmp (rsync over SSH)
@@ -67,7 +64,7 @@ jobs:
             "${APP_SRC}/" \
             "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${REMOTE_TMP}/"
 
-      - name: Bootstrap & Deploy on remote VM
+      - name: Bootstrap & Deploy on remote VM (no SELinux; firewalld open)
         run: |
           set -euo pipefail
           REMOTE_TMP="/tmp/php-app-${GITHUB_SHA}"
@@ -77,12 +74,11 @@ jobs:
             "DEPLOY_PATH='${DEPLOY_PATH}' SERVER_NAME='${SERVER_NAME}' REMOTE_TMP='${REMOTE_TMP}' bash -s" <<'REMOTE_EOF'
           set -euo pipefail
 
-          # 1) Install dependencies (idempotent)
-          if command -v dnf >/dev/null 2>&1; then PM=dnf; elif command -v yum >/dev/null 2>&1; then PM=yum; else echo "No dnf/yum"; exit 1; fi
-          sudo $PM -y install httpd php php-cli php-mysqlnd php-pdo php-gd php-xml php-mbstring rsync curl || true
-          sudo $PM -y install policycoreutils-python-utils || true
+          # 1) Install Apache/PHP (idempotent)
+          if command -v dnf >/dev/null 2>&1; then PM=dnf; elif command -v yum >/dev/null 2>&1; then PM=yum; else echo "No dnf/yum found"; exit 1; fi
+          sudo $PM -y install httpd php php-cli php-mysqlnd php-pdo php-gd php-xml php-mbstring rsync curl
 
-          # 2) Docroot
+          # 2) Create/own docroot
           sudo mkdir -p "$DEPLOY_PATH"
           sudo chown -R apache:apache "$DEPLOY_PATH"
 
@@ -100,29 +96,21 @@ jobs:
           </VirtualHost>
           CONF
 
-          # 4) SELinux contexts
-          if command -v semanage >/dev/null 2>&1; then
-            sudo semanage fcontext -a -t httpd_sys_content_t "${DEPLOY_PATH}(/.*)?" || true
-          fi
-          sudo restorecon -R "${DEPLOY_PATH}" || true
-
-          # 5) Deploy files
+          # 4) Deploy files
           sudo rsync -a --delete "${REMOTE_TMP}/" "${DEPLOY_PATH}/"
           sudo chown -R apache:apache "${DEPLOY_PATH}"
 
-          # 6) Apache on
+          # 5) Enable & restart Apache
           sudo systemctl enable --now httpd
           sudo systemctl restart httpd
 
-          # 7) Open firewall if needed
-          if systemctl is-active --quiet firewalld; then
-            sudo firewall-cmd --permanent --add-service=http || true
-            sudo firewall-cmd --reload || true
-          fi
+          # 6) Open HTTP in firewalld (firewalld is running per your note)
+          sudo firewall-cmd --permanent --add-service=http || true
+          sudo firewall-cmd --reload || true
 
-          # 8) Health check
+          # 7) Health check (force Host header to hit vhost)
           curl --fail -sS --resolve "${SERVER_NAME}:80:127.0.0.1" "http://${SERVER_NAME}/" | head -n 20
 
-          # 9) Cleanup
+          # 8) Cleanup
           rm -rf "${REMOTE_TMP}" || true
 REMOTE_EOF
