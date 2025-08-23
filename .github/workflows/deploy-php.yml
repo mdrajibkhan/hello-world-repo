@@ -1,0 +1,94 @@
+name: Deploy PHP app to Linux 9 VM (via SSH)
+
+on:
+  push:
+    branches: [ "main" ]     # change if needed
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    # Run on YOUR self-hosted runner
+    runs-on: [ self-hosted ]  # add labels if you've set them, e.g. [self-hosted, linux, php]
+    env:
+      APP_SRC: php-app
+      DEPLOY_PATH: /var/www/html/php-app
+      SERVER_NAME: php-app.local   # change or keep; used in Apache vhost & health check
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare SSH key & known_hosts
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          # Preload host key to avoid interactive prompt
+          ssh-keyscan -p "${{ secrets.SSH_PORT }}" -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Upload app to remote /tmp
+        run: |
+          set -euo pipefail
+          REMOTE_TMP="/tmp/php-app-${GITHUB_SHA}"
+          ssh -i ~/.ssh/id_rsa -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "rm -rf ${REMOTE_TMP} && mkdir -p ${REMOTE_TMP}"
+          scp -i ~/.ssh/id_rsa -P "${{ secrets.SSH_PORT }}" -r "${APP_SRC}/" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${REMOTE_TMP}/"
+
+      - name: Bootstrap & Deploy on remote VM
+        run: |
+          set -euo pipefail
+          REMOTE_TMP="/tmp/php-app-${GITHUB_SHA}"
+
+          ssh -i ~/.ssh/id_rsa -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "DEPLOY_PATH='${DEPLOY_PATH}' SERVER_NAME='${SERVER_NAME}' REMOTE_TMP='${REMOTE_TMP}' bash -s" <<'REMOTE_EOF'
+          set -euo pipefail
+
+          # 1) Install dependencies (idempotent)
+          if command -v dnf >/dev/null 2>&1; then PM=dnf; else PM=yum; fi
+          sudo $PM -y install httpd php php-cli php-mysqlnd php-pdo php-gd php-xml php-mbstring rsync curl
+          # SELinux helpers if available
+          sudo $PM -y install policycoreutils-python-utils || true
+
+          # 2) Create/own docroot
+          sudo mkdir -p "$DEPLOY_PATH"
+          sudo chown -R apache:apache "$DEPLOY_PATH"
+
+          # 3) Apache vhost (idempotent write)
+          sudo tee /etc/httpd/conf.d/php-app.conf >/dev/null <<CONF
+          <VirtualHost *:80>
+              ServerName ${SERVER_NAME}
+              DocumentRoot ${DEPLOY_PATH}
+              <Directory ${DEPLOY_PATH}>
+                  AllowOverride All
+                  Require all granted
+              </Directory>
+              ErrorLog /var/log/httpd/php-app-error.log
+              CustomLog /var/log/httpd/php-app-access.log combined
+          </VirtualHost>
+          CONF
+
+          # 4) SELinux contexts (safe if Enforcing)
+          if command -v semanage >/dev/null 2>&1; then
+            sudo semanage fcontext -a -t httpd_sys_content_t "${DEPLOY_PATH}(/.*)?" || true
+          fi
+          sudo restorecon -R "${DEPLOY_PATH}" || true
+
+          # 5) Move code from /tmp to docroot
+          sudo rsync -a --delete "${REMOTE_TMP}/" "${DEPLOY_PATH}/"
+          sudo chown -R apache:apache "${DEPLOY_PATH}"
+
+          # 6) Enable & restart Apache
+          sudo systemctl enable --now httpd
+          sudo systemctl restart httpd
+
+          # 7) Open firewall (if running)
+          if systemctl is-active --quiet firewalld; then
+            sudo firewall-cmd --permanent --add-service=http || true
+            sudo firewall-cmd --reload || true
+          fi
+
+          # 8) Health check
+          curl --fail -sS --resolve "${SERVER_NAME}:80:127.0.0.1" "http://${SERVER_NAME}/" | head -n 20
+
+          # 9) Cleanup
+          rm -rf "${REMOTE_TMP}" || true
