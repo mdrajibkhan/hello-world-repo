@@ -7,7 +7,7 @@ on:
 
 jobs:
   deploy:
-    runs-on: [ self-hosted ]   # add labels if you use them, e.g. [self-hosted, linux]
+    runs-on: [ self-hosted ]   # add your labels if any, e.g. [self-hosted, linux]
 
     env:
       APP_SRC: php-app
@@ -64,26 +64,24 @@ jobs:
             "${APP_SRC}/" \
             "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${REMOTE_TMP}/"
 
-      - name: Bootstrap & Deploy on remote VM (no SELinux; firewalld open)
+      - name: Build remote deploy script locally (no SELinux; firewalld open)
         run: |
           set -euo pipefail
-          REMOTE_TMP="/tmp/php-app-${GITHUB_SHA}"
-
-          ssh -i ~/.ssh/id_rsa -p "${{ secrets.SSH_PORT }}" \
-            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
-            "DEPLOY_PATH='${DEPLOY_PATH}' SERVER_NAME='${SERVER_NAME}' REMOTE_TMP='${REMOTE_TMP}' bash -s" <<'REMOTE_EOF'
+          SCRIPT="$RUNNER_TEMP/deploy-php.sh"
+          cat > "$SCRIPT" <<'EOS'
+          #!/usr/bin/env bash
           set -euo pipefail
 
-          # 1) Install Apache/PHP (idempotent)
+          # Expected env: DEPLOY_PATH, SERVER_NAME, REMOTE_TMP
           if command -v dnf >/dev/null 2>&1; then PM=dnf; elif command -v yum >/dev/null 2>&1; then PM=yum; else echo "No dnf/yum found"; exit 1; fi
           sudo $PM -y install httpd php php-cli php-mysqlnd php-pdo php-gd php-xml php-mbstring rsync curl
 
-          # 2) Create/own docroot
+          # Docroot
           sudo mkdir -p "$DEPLOY_PATH"
           sudo chown -R apache:apache "$DEPLOY_PATH"
 
-          # 3) Apache vhost
-          sudo tee /etc/httpd/conf.d/php-app.conf >/dev/null <<CONF
+          # Apache vhost
+          sudo bash -lc "cat > /etc/httpd/conf.d/php-app.conf <<CONF
           <VirtualHost *:80>
               ServerName ${SERVER_NAME}
               DocumentRoot ${DEPLOY_PATH}
@@ -94,23 +92,37 @@ jobs:
               ErrorLog /var/log/httpd/php-app-error.log
               CustomLog /var/log/httpd/php-app-access.log combined
           </VirtualHost>
-          CONF
+          CONF"
 
-          # 4) Deploy files
-          sudo rsync -a --delete "${REMOTE_TMP}/" "${DEPLOY_PATH}/"
-          sudo chown -R apache:apache "${DEPLOY_PATH}"
+          # Deploy files
+          sudo rsync -a --delete "$REMOTE_TMP/" "$DEPLOY_PATH/"
+          sudo chown -R apache:apache "$DEPLOY_PATH"
 
-          # 5) Enable & restart Apache
+          # Apache service
           sudo systemctl enable --now httpd
           sudo systemctl restart httpd
 
-          # 6) Open HTTP in firewalld (firewalld is running per your note)
-          sudo firewall-cmd --permanent --add-service=http || true
-          sudo firewall-cmd --reload || true
+          # Open HTTP in firewalld (if running)
+          if systemctl is-active --quiet firewalld; then
+            sudo firewall-cmd --permanent --add-service=http || true
+            sudo firewall-cmd --reload || true
+          fi
 
-          # 7) Health check (force Host header to hit vhost)
-          curl --fail -sS --resolve "${SERVER_NAME}:80:127.0.0.1" "http://${SERVER_NAME}/" | head -n 20
+          # Health check (target vhost via Host header)
+          curl --fail -sS --resolve "$SERVER_NAME:80:127.0.0.1" "http://$SERVER_NAME/" | head -n 20
+          EOS
+          chmod +x "$SCRIPT"
 
-          # 8) Cleanup
-          rm -rf "${REMOTE_TMP}" || true
-REMOTE_EOF
+      - name: Copy deploy script to remote
+        run: |
+          set -euo pipefail
+          scp -i ~/.ssh/id_rsa -P "${{ secrets.SSH_PORT }}" "$RUNNER_TEMP/deploy-php.sh" \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/deploy-php.sh"
+
+      - name: Execute remote deploy script
+        run: |
+          set -euo pipefail
+          REMOTE_TMP="/tmp/php-app-${GITHUB_SHA}"
+          ssh -i ~/.ssh/id_rsa -p "${{ secrets.SSH_PORT }}" \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "DEPLOY_PATH='${DEPLOY_PATH}' SERVER_NAME='${SERVER_NAME}' REMOTE_TMP='${REMOTE_TMP}' bash /tmp/deploy-php.sh"
